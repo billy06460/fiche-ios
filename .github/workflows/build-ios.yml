@@ -1,0 +1,117 @@
+name: Build iOS (TestFlight)
+
+# Lancement manuel : onglet Actions > "Build iOS (TestFlight)" > Run workflow.
+# Le resultat est envoye directement sur TestFlight (App Store Connect).
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Verifier les secrets Apple
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          missing=""
+          for v in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            [ -z "${!v}" ] && missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Secrets manquants (Settings > Secrets and variables > Actions) :$missing"
+            exit 1
+          fi
+
+      - name: Choisir la version la plus recente de Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Installer les dependances npm
+        run: npm install
+
+      - name: Ajouter la plateforme iOS
+        run: npx cap add ios
+
+      - name: Installer le plugin Messages natif (maison)
+        run: |
+          APPDIR=ios/App/App
+          # 1) le plugin et l'ecran principal sont ajoutes a AppDelegate.swift
+          #    (fichier deja compile par le projet Xcode : rien a declarer en plus)
+          { echo "import MessageUI"; cat "$APPDIR/AppDelegate.swift"; cat native-ios/SmsComposerPlugin.swift.inc; } > "$RUNNER_TEMP/AppDelegate.swift"
+          mv "$RUNNER_TEMP/AppDelegate.swift" "$APPDIR/AppDelegate.swift"
+          # 2) l'app demarre sur MainViewController (qui enregistre le plugin)
+          sed -i '' 's/customClass="CAPBridgeViewController" customModule="Capacitor"/customClass="MainViewController" customModule="App" customModuleProvider="target"/' "$APPDIR/Base.lproj/Main.storyboard"
+          grep -q 'customClass="MainViewController"' "$APPDIR/Base.lproj/Main.storyboard" || { echo "::error::Main.storyboard non modifie"; cat "$APPDIR/Base.lproj/Main.storyboard"; exit 1; }
+          # 3) textes d'autorisation (appareil photo / photos) et declaration de chiffrement
+          PL="$APPDIR/Info.plist"
+          /usr/libexec/PlistBuddy -c "Delete :NSCameraUsageDescription" "$PL" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string Prendre en photo les dégâts et les tickets carburant." "$PL"
+          /usr/libexec/PlistBuddy -c "Delete :NSPhotoLibraryUsageDescription" "$PL" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryUsageDescription string Ajouter des photos des dégâts à la fiche." "$PL"
+          /usr/libexec/PlistBuddy -c "Delete :NSPhotoLibraryAddUsageDescription" "$PL" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryAddUsageDescription string Enregistrer des photos de la fiche." "$PL"
+          /usr/libexec/PlistBuddy -c "Delete :ITSAppUsesNonExemptEncryption" "$PL" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$PL"
+
+      - name: Generer l'icone de l'app
+        run: npx capacitor-assets generate --ios
+
+      - name: Synchroniser le code web et les plugins natifs
+        run: npx cap sync ios
+
+      - name: Preparer la cle App Store Connect
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          grep -q "BEGIN PRIVATE KEY" "$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8" || { echo "::error::ASC_KEY_P8 doit contenir tout le fichier .p8 (lignes BEGIN/END comprises)"; exit 1; }
+
+      - name: Compiler et archiver l'app (signature automatique)
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          cd ios/App
+          if [ -d App.xcworkspace ]; then SRC="-workspace App.xcworkspace"; else SRC="-project App.xcodeproj"; fi
+          xcodebuild $SRC -scheme App -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} MARKETING_VERSION=1.${{ github.run_number }} \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            archive
+
+      - name: Envoyer sur TestFlight
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          sed "s/__TEAM_ID__/$APPLE_TEAM_ID/" native-ios/ExportOptions.plist > "$RUNNER_TEMP/ExportOptions.plist"
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          echo "Envoye sur App Store Connect : la version apparaitra dans TestFlight apres le traitement d'Apple (quelques minutes a une heure)."
